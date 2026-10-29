@@ -1,0 +1,8 @@
+{
+  "name": "Donari",
+  "description": "Donari - Cardápio e pedidos online.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -93,6 +93,15 @@ const translations = {
 const formatBRPhone = (value: string): string => {
   let val = value.replace(/\D/g, '');
   
+  // Strip country code +55 if mobile/browser autofill inserts 12+ digits starting with 55
+  if (val.length > 11 && val.startsWith('55')) {
+    val = val.slice(2);
+  }
+  // Strip leading trunk zero if autofill inserts 12 digits starting with 0 (e.g. 011999999999)
+  if (val.length === 12 && val.startsWith('0')) {
+    val = val.slice(1);
+  }
+
   // Truncate at 11 digits to strictly respect the 11-digit Brazilian mask: (99) 99999-9999
   if (val.length > 11) {
     val = val.slice(0, 11);
@@ -401,21 +410,54 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
     }
   }, [isCustomModalOpen, selectedProductForDetails]);
 
-  const [formData, setFormData] = useState({
-    nome: '',
-    telefone: '',
-    endereco: '',
-    street: '',
-    number: '',
-    zipCode: '',
-    city: '',
-    state: '',
-    aniversario: '',
-    observacao: '',
-    email: '',
-    deliveryOption: 'delivery' as 'delivery' | 'pickup',
-    scheduledDate: '',
-    scheduledTime: ''
+  const [hasSavedCustomerProfile, setHasSavedCustomerProfile] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('customer_profile_save');
+      if (!saved) return false;
+      const parsed = JSON.parse(saved);
+      return Boolean(parsed && (parsed.nome || parsed.telefone || parsed.email || parsed.street));
+    } catch {
+      return false;
+    }
+  });
+
+  const [formData, setFormData] = useState(() => {
+    const empty = {
+      nome: '',
+      telefone: '',
+      endereco: '',
+      street: '',
+      number: '',
+      zipCode: '',
+      city: '',
+      state: '',
+      aniversario: '',
+      observacao: '',
+      email: '',
+      deliveryOption: 'delivery' as 'delivery' | 'pickup',
+      scheduledDate: '',
+      scheduledTime: ''
+    };
+    try {
+      const saved = localStorage.getItem('customer_profile_save');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          ...empty,
+          nome: parsed.nome || '',
+          telefone: parsed.telefone ? formatBRPhone(String(parsed.telefone)) : '',
+          street: parsed.street || '',
+          number: parsed.number || '',
+          zipCode: parsed.zipCode || '',
+          city: parsed.city || '',
+          state: parsed.state || '',
+          aniversario: parsed.aniversario || '',
+          email: parsed.email || '',
+          deliveryOption: (parsed.deliveryOption === 'pickup' ? 'pickup' : 'delivery') as 'delivery' | 'pickup'
+        };
+      }
+    } catch {}
+    return empty;
   });
 
   const [activeScreen, setActiveScreen] = useState<'intro' | 'selector' | 'menu'>(() => {
@@ -1278,6 +1320,24 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
 
       console.log('Finalizando pedido...', orderData);
       await addDoc(collection(db, 'pedidos'), orderData);
+
+      try {
+        localStorage.setItem('customer_profile_save', JSON.stringify({
+          nome: formData.nome.trim(),
+          telefone: formData.telefone.trim(),
+          aniversario: formData.aniversario.trim(),
+          email: formData.email.trim(),
+          street: formData.street.trim(),
+          number: formData.number.trim(),
+          zipCode: formData.zipCode.trim(),
+          city: formData.city.trim(),
+          state: formData.state.trim(),
+          deliveryOption: formData.deliveryOption || 'delivery'
+        }));
+        setHasSavedCustomerProfile(true);
+      } catch (storageErr) {
+        console.warn('Não foi possível salvar dados do cliente localmente:', storageErr);
+      }
       
       // Automatic stock deduction for items with trackStock enabled (including dishes chosen inside combos)
       const stockDeductions: Record<string, number> = {};
@@ -1417,22 +1477,12 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
     setIsModalOpen(false);
     setCheckoutStep('summary');
     setStandardSuccessUrls(null);
-    setFormData({ 
-      nome: '', 
-      telefone: '', 
-      endereco: '', 
-      street: '',
-      number: '',
-      zipCode: '',
-      city: '',
-      state: '',
-      deliveryOption: 'delivery',
+    setFormData(prev => ({ 
+      ...prev,
       scheduledDate: '',
       scheduledTime: '',
-      aniversario: '', 
-      observacao: '', 
-      email: '' 
-    });
+      observacao: ''
+    }));
   };
 
   const handleCompleteB2bOrder = () => {
@@ -2825,11 +2875,14 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       </div>
                     )}
 
-                    <form onSubmit={handleFinalizarB2b} className="space-y-4">
+                    <form onSubmit={handleFinalizarB2b} autoComplete="on" className="space-y-4">
                       {/* Company Name */}
                       <div className="space-y-1 relative">
-                        <label className="text-xs font-bold uppercase text-black">Razão Social / Nome da Empresa *</label>
+                        <label htmlFor="b2b-company" className="text-xs font-bold uppercase text-black">Razão Social / Nome da Empresa *</label>
                         <input 
+                          id="b2b-company"
+                          name="organization"
+                          autoComplete="organization"
                           required
                           type="text" 
                           placeholder="Ex: Nome da Empresa Ltda"
@@ -2875,8 +2928,11 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       {/* Responsible names */}
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">Nome do Responsável / Contato *</label>
+                          <label htmlFor="b2b-responsible" className="text-xs font-bold uppercase text-black">Nome do Responsável / Contato *</label>
                           <input 
+                            id="b2b-responsible"
+                            name="name"
+                            autoComplete="name"
                             required
                             type="text" 
                             className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black font-sans font-semibold"
@@ -2887,8 +2943,12 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                         </div>
 
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">Telefone Corporativo / WhatsApp *</label>
+                          <label htmlFor="b2b-phone" className="text-xs font-bold uppercase text-black">Telefone Corporativo / WhatsApp *</label>
                           <input 
+                            id="b2b-phone"
+                            name="tel"
+                            autoComplete="tel"
+                            inputMode="tel"
                             required
                             type="tel" 
                             className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black font-sans font-semibold"
@@ -2902,8 +2962,11 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
 
                       {/* Commercial Address */}
                       <div className="space-y-1">
-                        <label className="text-xs font-bold uppercase text-black">Endereço de Entrega da Empresa *</label>
+                        <label htmlFor="b2b-address" className="text-xs font-bold uppercase text-black">Endereço de Entrega da Empresa *</label>
                         <input 
+                          id="b2b-address"
+                          name="street-address"
+                          autoComplete="street-address"
                           required
                           type="text" 
                           placeholder="Rua, Número, Complemento, Bairro..."
@@ -2917,8 +2980,12 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       {/* Zip Code and City */}
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">CEP *</label>
+                          <label htmlFor="b2b-zip" className="text-xs font-bold uppercase text-black">CEP *</label>
                           <input 
+                            id="b2b-zip"
+                            name="postal-code"
+                            autoComplete="postal-code"
+                            inputMode="numeric"
                             required
                             type="text" 
                             placeholder="00000-000"
@@ -2929,8 +2996,11 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                           />
                         </div>
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">Cidade *</label>
+                          <label htmlFor="b2b-city" className="text-xs font-bold uppercase text-black">Cidade *</label>
                           <input 
+                            id="b2b-city"
+                            name="city"
+                            autoComplete="address-level2"
                             required
                             type="text" 
                             placeholder="Cidade"
@@ -3046,10 +3116,56 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       </div>
                     )}
 
-                    <form onSubmit={handleFinalizar} className="space-y-4">
+                    {hasSavedCustomerProfile && (
+                      <div className="p-3 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-950 flex items-center justify-between gap-2 font-sans">
+                        <div className="space-y-0.5">
+                          <p className="text-xs font-bold text-emerald-800 flex items-center gap-1.5">
+                            <Check size={14} className="text-emerald-600 flex-shrink-0" />
+                            <span>Dados preenchidos automaticamente</span>
+                          </p>
+                          <p className="text-[10px] text-emerald-800/80 leading-tight font-medium">
+                            Confira seus dados e escolha a data do pedido abaixo.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            try {
+                              localStorage.removeItem('customer_profile_save');
+                            } catch {}
+                            setHasSavedCustomerProfile(false);
+                            setFormData({
+                              nome: '',
+                              telefone: '',
+                              endereco: '',
+                              street: '',
+                              number: '',
+                              zipCode: '',
+                              city: '',
+                              state: '',
+                              aniversario: '',
+                              observacao: '',
+                              email: '',
+                              deliveryOption: 'delivery',
+                              scheduledDate: '',
+                              scheduledTime: ''
+                            });
+                            toast.success('Dados limpos para novo preenchimento.');
+                          }}
+                          className="flex-shrink-0 text-[10px] font-bold text-red-700 bg-white hover:bg-red-50 border border-red-200 px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors"
+                        >
+                          Limpar dados
+                        </button>
+                      </div>
+                    )}
+
+                    <form onSubmit={handleFinalizar} autoComplete="on" className="space-y-4">
                       <div className="space-y-1">
-                        <label className="text-xs font-bold uppercase text-black">{t.fullName}</label>
+                        <label htmlFor="checkout-name" className="text-xs font-bold uppercase text-black">{t.fullName}</label>
                         <input 
+                          id="checkout-name"
+                          name="name"
+                          autoComplete="name"
                           required
                           type="text" 
                           className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black"
@@ -3060,12 +3176,16 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       </div>
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black flex items-center gap-1">
+                          <label htmlFor="checkout-phone" className="text-xs font-bold uppercase text-black flex items-center gap-1">
                             {t.phone} <span className="text-green-600 font-extrabold text-[10px] bg-green-50 px-1.5 py-0.5 rounded border border-green-200">BR (+55)</span>
                           </label>
                           <div className="relative flex items-center">
                             <span className="absolute left-3 text-xs font-extrabold text-green-700 bg-green-50 px-1 rounded pointer-events-none select-none">+55</span>
                             <input 
+                              id="checkout-phone"
+                              name="tel"
+                              autoComplete="tel"
+                              inputMode="tel"
                               required
                               type="tel" 
                               className="w-full p-3 pl-12 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black font-semibold"
@@ -3077,10 +3197,14 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                           </div>
                         </div>
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">
+                          <label htmlFor="checkout-birthday" className="text-xs font-bold uppercase text-black">
                             {t.birthday}
                           </label>
                           <input 
+                            id="checkout-birthday"
+                            name="birthday"
+                            autoComplete="off"
+                            inputMode="numeric"
                             required
                             type="text" 
                             placeholder={t.birthdayPlaceholder}
@@ -3099,8 +3223,12 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                         </div>
                       </div>
                       <div className="space-y-1">
-                        <label className="text-xs font-bold uppercase text-black">{t.email}</label>
+                        <label htmlFor="checkout-email" className="text-xs font-bold uppercase text-black">{t.email}</label>
                         <input 
+                          id="checkout-email"
+                          name="email"
+                          autoComplete="email"
+                          inputMode="email"
                           required
                           type="email" 
                           className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black"
@@ -3164,8 +3292,11 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                         <div className="md:col-span-2 space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">{t.street}</label>
+                          <label htmlFor="checkout-street" className="text-xs font-bold uppercase text-black">{t.street}</label>
                           <input 
+                            id="checkout-street"
+                            name="street-address"
+                            autoComplete="street-address"
                             required
                             type="text" 
                             className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black"
@@ -3175,8 +3306,11 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                           />
                         </div>
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">{t.number}</label>
+                          <label htmlFor="checkout-number" className="text-xs font-bold uppercase text-black">{t.number}</label>
                           <input 
+                            id="checkout-number"
+                            name="address-line2"
+                            autoComplete="address-line2"
                             type="text" 
                             className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black"
                             style={{ '--tw-ring-color': settings.primaryColor } as any}
@@ -3188,8 +3322,11 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">{t.city}</label>
+                          <label htmlFor="checkout-city" className="text-xs font-bold uppercase text-black">{t.city}</label>
                           <input 
+                            id="checkout-city"
+                            name="city"
+                            autoComplete="address-level2"
                             required
                             type="text" 
                             className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black"
@@ -3199,8 +3336,11 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                           />
                         </div>
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">{t.state}</label>
+                          <label htmlFor="checkout-state" className="text-xs font-bold uppercase text-black">{t.state}</label>
                           <input 
+                            id="checkout-state"
+                            name="state"
+                            autoComplete="address-level1"
                             required
                             type="text" 
                             className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black"
@@ -3212,8 +3352,10 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                       </div>
 
                       <div className="space-y-1">
-                        <label className="text-xs font-bold uppercase text-black">{t.observation}</label>
+                        <label htmlFor="checkout-observation" className="text-xs font-bold uppercase text-black">{t.observation}</label>
                         <textarea 
+                          id="checkout-observation"
+                          name="observation"
                           rows={2}
                           className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black"
                           style={{ '--tw-ring-color': settings.primaryColor } as any}

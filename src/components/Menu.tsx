@@ -46,7 +46,7 @@ const translations = {
     whatsappDate: 'Data',
     whatsappAt: 'às',
     pickupDate: 'Data de Entrega/Retirada',
-    pickupDatePlaceholder: 'MM/DD/AAAA',
+    pickupDatePlaceholder: 'DD/MM/AAAA',
     consultMessage: 'Existem itens no pedido com valores a consultar. Aguarde a confirmação pelo WhatsApp.'
   },
   en: {
@@ -1548,6 +1548,12 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
       zipCode: b2bZipCode,
       city: b2bCity,
       pickupDate: b2bDate ? (() => {
+        if (b2bDate.includes('/')) return b2bDate;
+        const [year, month, day] = b2bDate.split('-');
+        return `${day}/${month}/${year}`;
+      })() : '',
+      scheduledDate: b2bDate ? (() => {
+        if (b2bDate.includes('/')) return b2bDate;
         const [year, month, day] = b2bDate.split('-');
         return `${day}/${month}/${year}`;
       })() : '',
@@ -3045,14 +3051,14 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                         </div>
 
                         <div className="space-y-1">
-                          <label className="text-xs font-bold uppercase text-black">Data Prevista de Entrega *</label>
-                          <input 
-                            required
-                            type="date" 
-                            className="w-full p-3 rounded-xl border border-gray-300 focus:ring-2 outline-none text-black font-sans font-semibold"
-                            style={{ '--tw-ring-color': settings.primaryColor } as any}
+                          <label className="text-xs font-bold uppercase text-black">Data Prevista de Entrega (DD/MM/AAAA) *</label>
+                          <BRDatePicker
+                            placeholder="DD/MM/AAAA"
                             value={b2bDate}
-                            onChange={e => setB2bDate(e.target.value)}
+                            onChange={(val) => setB2bDate(val)}
+                            primaryColor={settings.primaryColor}
+                            disablePast={true}
+                            minDate={new Date()}
                           />
                         </div>
                       </div>
@@ -6371,14 +6377,15 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                   <div className="space-y-1">
                     <label className="text-[10px] font-extrabold uppercase tracking-wider text-black flex items-center gap-1.5">
                       <Calendar size={12} className="text-[#865d39]" /> 
-                      Data Agendada de Entrega *
+                      Data Agendada de Entrega (DD/MM/AAAA) *
                     </label>
-                    <input 
-                      type="date" 
-                      className="w-full p-3 rounded-xl border border-gray-300 bg-white text-xs outline-none text-black font-extrabold text-black active:border-black select-all"
-                      style={{ color: '#000000' }}
+                    <BRDatePicker
+                      placeholder="DD/MM/AAAA"
                       value={b2bDate}
-                      onChange={e => setB2bDate(e.target.value)}
+                      onChange={(val) => setB2bDate(val)}
+                      primaryColor={settings.primaryColor || '#865d39'}
+                      disablePast={true}
+                      minDate={new Date()}
                     />
                   </div>
 
@@ -6504,8 +6511,9 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                         
                         // Construct state map and trigger submitting method
                         const formattedDateForDb = (() => {
+                          if (b2bDate.includes('/')) return b2bDate;
                           const [year, month, day] = b2bDate.split('-');
-                          return `${month}/${day}/${year}`;
+                          return `${day}/${month}/${year}`;
                         })();
 
                         const orderItems = [];
@@ -6518,6 +6526,7 @@ export default function Menu({ settings: initialSettings }: { settings: Settings
                           phone: b2bPhone,
                           address: b2bAddress,
                           pickupDate: formattedDateForDb,
+                          scheduledDate: formattedDateForDb,
                           deliveryStatus: 'pending',
                           paymentStatus: 'pending',
                           birthday: '',

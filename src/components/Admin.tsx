@@ -1,5 +1,6 @@
 import { PrintReceiptModal, PrintReceiptData } from "./PrintReceiptModal";
 import React, { useState, useEffect, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { db, auth } from '../firebase';
 import { 
   collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, setDoc, 
@@ -100,51 +101,109 @@ const getCleanWhatsAppPhone = (phone: string): string => {
   return clean;
 };
 
-const handleDateMask = (value: string): string => {
-  const cleanValue = value.replace(/\D/g, '').substring(0, 8);
-  let formatted = '';
-  if (cleanValue.length > 0) {
-    formatted += cleanValue.substring(0, 2);
-  }
-  if (cleanValue.length > 2) {
-    formatted += '/' + cleanValue.substring(2, 4);
-  }
-  if (cleanValue.length > 4) {
-    formatted += '/' + cleanValue.substring(4, 8);
-  }
-  return formatted;
+const toLocalISODate = (d: Date): string => {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 };
 
-const ddmmyyyyToYyyymmdd = (str: string): string => {
-  if (!str) return '';
+const parseOrderDateBR = (str?: string): Date | null => {
+  if (!str || typeof str !== 'string') return null;
   const clean = str.trim();
-  if (clean.includes('/')) {
-    const parts = clean.split('/');
-    if (parts.length === 3) {
-      const d = parts[0].padStart(2, '0');
-      const m = parts[1].padStart(2, '0');
-      const y = parts[2];
-      return `${y}-${m}-${d}`;
+  if (!clean) return null;
+
+  const ymdMatch = clean.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (ymdMatch) {
+    const y = parseInt(ymdMatch[1], 10);
+    const m = parseInt(ymdMatch[2], 10);
+    const d = parseInt(ymdMatch[3], 10);
+    if (d >= 1 && d <= 31 && m >= 1 && m <= 12 && y >= 1900) {
+      const dt = new Date(y, m - 1, d);
+      dt.setHours(0, 0, 0, 0);
+      return dt;
     }
   }
-  if (clean.includes('-') && clean.length === 10) return clean;
-  return '';
+
+  const slashMatch = clean.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (slashMatch) {
+    const part1 = parseInt(slashMatch[1], 10);
+    const part2 = parseInt(slashMatch[2], 10);
+    const y = parseInt(slashMatch[3], 10);
+    let d = part1;
+    let m = part2;
+    // Padrão brasileiro DD/MM/AAAA sempre tem prioridade; só inverte se o 2º número for > 12 (dado legado US)
+    if (part2 > 12 && part1 <= 12) {
+      d = part2;
+      m = part1;
+    }
+    if (d >= 1 && d <= 31 && m >= 1 && m <= 12 && y >= 1900) {
+      const dt = new Date(y, m - 1, d);
+      dt.setHours(0, 0, 0, 0);
+      return dt;
+    }
+  }
+
+  const parsed = Date.parse(clean);
+  if (!isNaN(parsed)) {
+    const dt = new Date(parsed);
+    dt.setHours(0, 0, 0, 0);
+    return dt;
+  }
+  return null;
 };
 
-const yyyymmddToDdmmyyyy = (str: string): string => {
-  if (!str) return '';
-  const clean = str.trim();
-  if (clean.includes('-')) {
-    const parts = clean.split('-');
-    if (parts.length === 3) {
-      const y = parts[0];
-      const m = parts[1].padStart(2, '0');
-      const d = parts[2].padStart(2, '0');
-      return `${d}/${m}/${y}`;
+const getCreatedAtDate = (createdAt: any): Date | null => {
+  if (!createdAt) return null;
+  let dObj: Date | null = null;
+  if (typeof createdAt.toDate === 'function') {
+    dObj = createdAt.toDate();
+  } else if (createdAt.seconds) {
+    dObj = new Date(createdAt.seconds * 1000);
+  } else if (createdAt instanceof Date) {
+    dObj = createdAt;
+  } else if (typeof createdAt === 'string' || typeof createdAt === 'number') {
+    const parsed = new Date(createdAt);
+    if (!isNaN(parsed.getTime())) dObj = parsed;
+  }
+  if (dObj && !isNaN(dObj.getTime())) {
+    const normalized = new Date(dObj.getFullYear(), dObj.getMonth(), dObj.getDate());
+    normalized.setHours(0, 0, 0, 0);
+    return normalized;
+  }
+  return null;
+};
+
+const resolveOrderDateWithCreatedAt = (rawDateStr?: string, createdAt?: any): Date | null => {
+  const parsed = parseOrderDateBR(rawDateStr);
+  if (!parsed) return null;
+  const created = getCreatedAtDate(createdAt);
+  if (!created) return parsed;
+
+  // Corrige legado: quando calendário antigo US (MM/DD/AAAA) salvou dia/mês invertidos (ex: 09/11/2026 gravado como 2026-09-11)
+  const diffDaysFromCreated = (parsed.getTime() - created.getTime()) / (1000 * 60 * 60 * 24);
+  if (diffDaysFromCreated < -14) {
+    const m = parsed.getMonth() + 1;
+    const d = parsed.getDate();
+    const y = parsed.getFullYear();
+    if (m <= 12 && d <= 12 && m !== d) {
+      const swapped = new Date(y, d - 1, m);
+      swapped.setHours(0, 0, 0, 0);
+      const swappedDiff = (swapped.getTime() - created.getTime()) / (1000 * 60 * 60 * 24);
+      if (swappedDiff >= -3 && swappedDiff <= 180) {
+        return swapped;
+      }
     }
   }
-  if (clean.includes('/')) return clean;
-  return '';
+  return parsed;
+};
+
+const getOrderEffectiveDate = (order: Order): Date | null => {
+  return (
+    resolveOrderDateWithCreatedAt(order.scheduledDate, order.createdAt) ||
+    resolveOrderDateWithCreatedAt(order.pickupDate, order.createdAt) ||
+    getCreatedAtDate(order.createdAt)
+  );
 };
 
 const formatOrderFullDate = (val: any): string => {
@@ -179,29 +238,10 @@ const getOrderScheduledInfo = (order: Order): { date: Date | null, timeStr: stri
   let dateDisplay = '';
 
   if (order.scheduledDate) {
-    const raw = order.scheduledDate.trim();
-    if (raw.includes('/')) {
-      const parts = raw.split('/');
-      if (parts.length === 3) {
-        const d = parseInt(parts[0], 10);
-        const m = parseInt(parts[1], 10);
-        const y = parseInt(parts[2], 10);
-        if (d && m && y) {
-          date = new Date(y, m - 1, d);
-          dateDisplay = `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}`;
-        }
-      }
-    } else if (raw.includes('-')) {
-      const parts = raw.split('-');
-      if (parts.length === 3) {
-        const y = parseInt(parts[0], 10);
-        const m = parseInt(parts[1], 10);
-        const d = parseInt(parts[2], 10);
-        if (d && m && y) {
-          date = new Date(y, m - 1, d);
-          dateDisplay = `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}`;
-        }
-      }
+    const parsed = resolveOrderDateWithCreatedAt(order.scheduledDate, order.createdAt);
+    if (parsed) {
+      date = parsed;
+      dateDisplay = `${String(parsed.getDate()).padStart(2, '0')}/${String(parsed.getMonth() + 1).padStart(2, '0')}/${parsed.getFullYear()}`;
     }
   }
 
@@ -215,31 +255,10 @@ const getOrderScheduledInfo = (order: Order): { date: Date | null, timeStr: stri
       timeStr = timeMatch[1];
     }
 
-    const ymdMatch = str.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
-    if (ymdMatch) {
-      const y = parseInt(ymdMatch[1], 10);
-      const m = parseInt(ymdMatch[2], 10);
-      const d = parseInt(ymdMatch[3], 10);
-      date = new Date(y, m - 1, d);
-      dateDisplay = `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}`;
-    } else {
-      const slashMatch = str.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-      if (slashMatch) {
-        let part1 = parseInt(slashMatch[1], 10);
-        let part2 = parseInt(slashMatch[2], 10);
-        let y = parseInt(slashMatch[3], 10);
-        let d = part1;
-        let m = part2;
-        if (part1 > 12) {
-          d = part1;
-          m = part2;
-        } else if (part2 > 12) {
-          d = part2;
-          m = part1;
-        }
-        date = new Date(y, m - 1, d);
-        dateDisplay = `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}`;
-      }
+    const parsed = resolveOrderDateWithCreatedAt(str, order.createdAt);
+    if (parsed) {
+      date = parsed;
+      dateDisplay = `${String(parsed.getDate()).padStart(2, '0')}/${String(parsed.getMonth() + 1).padStart(2, '0')}/${parsed.getFullYear()}`;
     }
   }
 
@@ -299,10 +318,13 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
   
   // Finance States
   const [variableCosts, setVariableCosts] = useState<VariableCost[]>([]);
-  const [newVarCost, setNewVarCost] = useState<Partial<VariableCost>>({ description: '', amount: 0, date: new Date().toISOString().split('T')[0] });
+  const [newVarCost, setNewVarCost] = useState<Partial<VariableCost>>({ description: '', amount: 0, date: toLocalISODate(new Date()) });
   const [varCostAmountInput, setVarCostAmountInput] = useState('');
   const [isEditingVarCost, setIsEditingVarCost] = useState<VariableCost | null>(null);
   const [isProportionalFixed, setIsProportionalFixed] = useState<boolean>(true);
+  const [showFinanceOrdersModal, setShowFinanceOrdersModal] = useState<boolean>(false);
+  const [financeOrdersSearch, setFinanceOrdersSearch] = useState<string>('');
+  const [financeOrdersScope, setFinanceOrdersScope] = useState<'period' | 'all'>('period');
 
   // EGN Cash Flow Simulation states
   const [financeSubTab, setFinanceSubTab] = useState<'real' | 'simulation'>('real');
@@ -359,12 +381,12 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
   const [financeStartDate, setFinanceStartDate] = useState<string>(() => {
     const now = new Date();
     const firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
-    return firstDay.toISOString().split('T')[0];
+    return toLocalISODate(firstDay);
   });
   const [financeEndDate, setFinanceEndDate] = useState<string>(() => {
     const now = new Date();
     const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-    return lastDay.toISOString().split('T')[0];
+    return toLocalISODate(lastDay);
   });
 
   // Fixed Costs Inputs
@@ -828,8 +850,26 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       setCategories(sorted);
     });
 
-    const unsubOrders = onSnapshot(query(collection(db, 'pedidos'), orderBy('createdAt', 'desc')), (snapshot) => {
-      setOrders(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Order)));
+    const unsubOrders = onSnapshot(collection(db, 'pedidos'), (snapshot) => {
+      const getTs = (val: any): number => {
+        if (!val) return 0;
+        if (typeof val.toDate === 'function') return val.toDate().getTime();
+        if (val.seconds) return val.seconds * 1000;
+        if (val instanceof Date) return val.getTime();
+        if (typeof val === 'string' || typeof val === 'number') {
+          const t = new Date(val).getTime();
+          return isNaN(t) ? 0 : t;
+        }
+        return 0;
+      };
+      const fetched = snapshot.docs
+        .map(d => ({ id: d.id, ...d.data() } as Order))
+        .sort((a, b) => {
+          const ta = getTs(a.createdAt) || getOrderEffectiveDate(a)?.getTime() || 0;
+          const tb = getTs(b.createdAt) || getOrderEffectiveDate(b)?.getTime() || 0;
+          return tb - ta;
+        });
+      setOrders(fetched);
     }, (error) => {
       console.error('Admin: Erro ao carregar pedidos:', error);
     });
@@ -942,7 +982,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       const dataToSave = {
         description: newVarCost.description,
         amount: amountVal,
-        date: newVarCost.date || new Date().toISOString().split('T')[0]
+        date: newVarCost.date || toLocalISODate(new Date())
       };
 
       if (isEditingVarCost) {
@@ -954,7 +994,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         toast.success('Custo variável adicionado!');
       }
 
-      setNewVarCost({ description: '', amount: 0, date: new Date().toISOString().split('T')[0] });
+      setNewVarCost({ description: '', amount: 0, date: toLocalISODate(new Date()) });
       setVarCostAmountInput('');
     } catch (err) {
       console.error('Erro ao salvar custo variável:', err);
@@ -1869,7 +1909,9 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       return;
     }
 
-    let finalPrice = selectedManualProduct.price;
+    let finalPrice = (selectedManualProduct.price && selectedManualProduct.price > 0)
+      ? selectedManualProduct.price
+      : (selectedManualProduct.oldPrice || 0);
     let titleDetail = selectedManualProduct.title;
     let itemSize: any = null;
 
@@ -1878,7 +1920,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         toast.error('Por favor, selecione um tamanho/variação.');
         return;
       }
-      finalPrice = selectedManualSize.price;
+      finalPrice = selectedManualSize.price || 0;
       titleDetail = `${selectedManualProduct.title} (${selectedManualSize.name})`;
       itemSize = selectedManualSize;
     }
@@ -1892,6 +1934,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       }
       if (selectedManualMealSides.length > 0) {
         titleDetail += ` [Acomp: ${selectedManualMealSides.map(s => s.name).join(', ')}]`;
+        finalPrice += selectedManualMealSides.reduce((sum, s) => sum + (Number(s.price) || 0), 0);
       }
     }
 
@@ -1912,11 +1955,11 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       productId: selectedManualProduct.id,
       title: titleDetail,
       quantity: manualProductQty,
-      price: finalPrice,
+      price: Number(finalPrice) || 0,
       priceType: selectedManualProduct.priceType || 'fixed',
-      mealOptions: selectedManualProduct.isMeal ? mealOpts : undefined,
-      selectedSize: itemSize || undefined,
-      cakeOptions: selectedManualProduct.isCustomCake ? cakeOpts : undefined,
+      mealOptions: selectedManualProduct.isMeal ? mealOpts : null,
+      selectedSize: itemSize || null,
+      cakeOptions: selectedManualProduct.isCustomCake ? cakeOpts : null,
     };
 
     setManualOrderItems([...manualOrderItems, newItem]);
@@ -1978,18 +2021,96 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
   };
 
   const handleCreateManualOrder = async () => {
-    if (manualOrderItems.length === 0) {
+    let itemsToSave = [...manualOrderItems];
+
+    // Se o administrador preencheu um item e clicou direto em "Confirmar e Criar Pedido", inclui automaticamente
+    if (itemsToSave.length === 0) {
+      if (manualItemSource === 'custom' && customItemName.trim()) {
+        const cleanPrice = customItemPrice.toString().replace(',', '.').trim();
+        const parsedPrice = parseFloat(cleanPrice);
+        if (!isNaN(parsedPrice) && parsedPrice >= 0 && customItemQty > 0) {
+          let titleDetail = customItemName.trim();
+          if (customItemNotes.trim()) {
+            titleDetail += ` [Obs: ${customItemNotes.trim()}]`;
+          }
+          itemsToSave = [{
+            id: Math.random().toString(36).substr(2, 9),
+            productId: 'custom_' + Date.now(),
+            title: titleDetail,
+            quantity: customItemQty,
+            price: parsedPrice,
+            priceType: 'fixed',
+            isCustomItem: true,
+            notes: customItemNotes.trim() || undefined
+          }];
+        }
+      } else if (manualItemSource === 'catalog' && selectedManualProduct) {
+        if (selectedManualProduct.hasSizes && selectedManualProduct.sizes && selectedManualProduct.sizes.length > 0 && !selectedManualSize) {
+          toast.error('Por favor, selecione o tamanho/variação e clique em "Adicionar Item ao Pedido".');
+          return;
+        }
+        let finalPrice = (selectedManualProduct.price && selectedManualProduct.price > 0)
+          ? selectedManualProduct.price
+          : (selectedManualProduct.oldPrice || 0);
+        let titleDetail = selectedManualProduct.title;
+        let itemSize: any = null;
+        if (selectedManualProduct.hasSizes && selectedManualSize) {
+          finalPrice = selectedManualSize.price || 0;
+          titleDetail = `${selectedManualProduct.title} (${selectedManualSize.name})`;
+          itemSize = selectedManualSize;
+        }
+        const mealOpts: any = {};
+        if (selectedManualProduct.isMeal) {
+          mealOpts.removals = selectedManualMealRemovals;
+          mealOpts.sides = selectedManualMealSides;
+          if (selectedManualMealRemovals.length > 0) titleDetail += ` [Sem: ${selectedManualMealRemovals.join(', ')}]`;
+          if (selectedManualMealSides.length > 0) {
+            titleDetail += ` [Acomp: ${selectedManualMealSides.map(s => s.name).join(', ')}]`;
+            finalPrice += selectedManualMealSides.reduce((sum, s) => sum + (Number(s.price) || 0), 0);
+          }
+        }
+        const cakeOpts: any = {};
+        if (selectedManualProduct.isCustomCake) {
+          cakeOpts.size = selectedManualCakeOptions.size;
+          cakeOpts.dough = selectedManualCakeOptions.dough;
+          cakeOpts.fillings = selectedManualCakeOptions.fillings;
+          cakeOpts.topping = selectedManualCakeOptions.topping;
+          cakeOpts.topper = selectedManualCakeOptions.topper;
+          cakeOpts.styleNumber = selectedManualCakeOptions.styleNumber;
+          titleDetail += ` [Bolo: ${cakeOpts.size || ''}, ${cakeOpts.dough || ''}, Recheio: ${(cakeOpts.fillings || []).join(' e ')}]`;
+        }
+        itemsToSave = [{
+          id: Math.random().toString(36).substr(2, 9),
+          productId: selectedManualProduct.id,
+          title: titleDetail,
+          quantity: manualProductQty,
+          price: Number(finalPrice) || 0,
+          priceType: selectedManualProduct.priceType || 'fixed',
+          mealOptions: selectedManualProduct.isMeal ? mealOpts : null,
+          selectedSize: itemSize || null,
+          cakeOptions: selectedManualProduct.isCustomCake ? cakeOpts : null,
+        }];
+      }
+    }
+
+    if (itemsToSave.length === 0) {
       toast.error('Adicione pelo menos um item ao pedido.');
       return;
     }
-    if (!manualOrderForm.customerName) {
+    const cleanCustomerName = (manualOrderForm.customerName || '').trim().slice(0, 100);
+    if (!cleanCustomerName) {
       toast.error('O nome do cliente é obrigatório.');
+      return;
+    }
+    const cleanPhone = (manualOrderForm.phone || '').trim();
+    if (!cleanPhone) {
+      toast.error('O WhatsApp/telefone do cliente é obrigatório.');
       return;
     }
 
     try {
       setIsSaving(true);
-      const total = manualOrderItems.reduce((acc, item) => acc + (item.price * item.quantity), 0);
+      const total = itemsToSave.reduce((acc, item) => acc + ((Number(item.price) || 0) * (Number(item.quantity) || 1)), 0);
 
       const fullAddr = manualOrderForm.deliveryOption === 'pickup'
         ? 'Retirada no Local'
@@ -1997,9 +2118,13 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
             ? `${manualOrderForm.street}${manualOrderForm.number ? ', nº ' + manualOrderForm.number : ''}${manualOrderForm.city ? ' - ' + manualOrderForm.city : ''}${manualOrderForm.zipCode ? ' (' + manualOrderForm.zipCode + ')' : ''}`
             : (manualOrderForm.address || ''));
 
-      const orderData = {
-        customerName: manualOrderForm.customerName,
-        phone: manualOrderForm.phone || '',
+      const cleanDate = (manualOrderForm.pickupDate || '').trim();
+      const optionLabel = manualOrderForm.deliveryOption === 'pickup' ? 'RETIRADA' : 'DELIVERY';
+      const formattedPickupDate = cleanDate ? `${cleanDate} (${optionLabel})` : '';
+
+      const orderData = cleanFirestoreData({
+        customerName: cleanCustomerName,
+        phone: cleanPhone,
         email: manualOrderForm.email || '',
         address: fullAddr,
         street: manualOrderForm.street || '',
@@ -2008,30 +2133,54 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         city: manualOrderForm.city || '',
         deliveryOption: manualOrderForm.deliveryOption || 'delivery',
         birthday: manualOrderForm.birthday || '',
-        pickupDate: manualOrderForm.pickupDate || '',
+        pickupDate: formattedPickupDate,
+        scheduledDate: cleanDate,
+        scheduledTime: '',
         deliveryStatus: 'pending',
         paymentStatus: 'pending',
         observation: manualOrderForm.observation || '',
-        items: manualOrderItems.map(item => ({
-          title: item.title,
-          quantity: item.quantity,
-          price: item.price,
+        items: itemsToSave.map(item => ({
+          productId: item.productId || '',
+          title: item.title || 'Item',
+          quantity: Number(item.quantity) || 1,
+          price: Number(item.price) || 0,
           priceType: item.priceType || 'fixed',
           mealOptions: item.mealOptions || null,
           selectedSize: item.selectedSize || null,
           cakeOptions: item.cakeOptions || null,
-          isCustomItem: (item as any).isCustomItem || false
+          isCustomItem: (item as any).isCustomItem || false,
+          notes: (item as any).notes || ''
         })),
-        total: total,
-        subtotal: total,
+        total: Number(total) || 0,
+        subtotal: Number(total) || 0,
+        taxRate: 0,
+        taxAmount: 0,
+        isB2B: false,
+        isPJ: false,
+        isManual: true,
         createdAt: new Date(),
-        orderLanguage: settings?.language || 'pt'
-      };
+        orderLanguage: 'pt'
+      });
 
-      await addDoc(collection(db, 'pedidos'), orderData);
+      const docRef = await addDoc(collection(db, 'pedidos'), orderData);
+      setOrders(prev => {
+        if (prev.some(o => o.id === docRef.id)) return prev;
+        return [{ id: docRef.id, ...orderData } as Order, ...prev];
+      });
       toast.success('Pedido manual cadastrado com sucesso!');
+      if (cleanDate) {
+        const parsed = parseOrderDateBR(cleanDate);
+        if (parsed) {
+          setCalendarDate(parsed);
+        }
+      }
       setIsAddingOrder(false);
       setManualOrderItems([]);
+      setSelectedManualProduct(null);
+      setManualProductQty(1);
+      setSelectedManualSize(null);
+      setSelectedManualMealRemovals([]);
+      setSelectedManualMealSides([]);
       setCustomItemName('');
       setCustomItemPrice('');
       setCustomItemQty(1);
@@ -2063,43 +2212,19 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const parseDateString = (str: string, lang?: string) => {
-      if (!str || !str.includes('/')) return null;
-      const parts = str.split('/');
-      if (parts.length !== 3) return null;
-      
-      let month = parseInt(parts[0]);
-      let day = parseInt(parts[1]);
-      let year = parseInt(parts[2]);
-
-      // Always treat as MM/DD/YYYY by default (USA pattern), but if the first part (month) is > 12, it is definitely DD/MM/YYYY
-      if (month > 12) {
-        day = parseInt(parts[0]);
-        month = parseInt(parts[1]);
-      }
-      
-      if (!day || !month || !year || month > 12) return null;
-      return new Date(year, month - 1, day);
-    };
-
     const upcomingOrders = orders
       .map(o => {
-        if (!o.pickupDate) return null;
-        const d = parseDateString(o.pickupDate, o.orderLanguage || settings.language || 'pt');
+        const d = parseOrderDateBR(o.scheduledDate) || parseOrderDateBR(o.pickupDate);
         if (!d) return null;
-        d.setHours(0, 0, 0, 0);
         return { order: o, date: d };
       })
       .filter((item): item is { order: Order; date: Date } => item !== null && item.date >= today);
 
     if (upcomingOrders.length === 0) {
-      // If none are in the future, get the closest one overall that has a pickupDate
       const allWithDate = orders
         .map(o => {
-          if (!o.pickupDate) return null;
-          const d = parseDateString(o.pickupDate, o.orderLanguage || settings.language || 'pt');
+          const d = getOrderEffectiveDate(o);
           if (!d) return null;
-          d.setHours(0, 0, 0, 0);
           return { order: o, date: d };
         })
         .filter((item): item is { order: Order; date: Date } => item !== null);
@@ -2112,7 +2237,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
 
     upcomingOrders.sort((a, b) => a.date.getTime() - b.date.getTime());
     return upcomingOrders[0].order;
-  }, [orders, settings.language]);
+  }, [orders]);
 
   const triggerPrintWorkflow = (htmlContent: string, title: string, textVersion: string, order?: Order) => {
     setActivePrintReceipt({
@@ -2376,11 +2501,11 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       const optionLabel = (editOrderForm.deliveryOption || isEditingOrder.deliveryOption) === 'pickup' ? 'RETIRADA' : 'DELIVERY';
       const formattedPickupDate = cleanDate ? `${cleanDate} (${optionLabel})` : '';
 
-      const updatedForm: Partial<Order> = {
+      const updatedForm: Partial<Order> = cleanFirestoreData({
         ...editOrderForm,
         scheduledDate: cleanDate,
         pickupDate: formattedPickupDate
-      };
+      });
 
       setOrders(prev => prev.map(o => o.id === orderId ? { ...o, ...updatedForm } as Order : o));
       setSelectedOrderModal(prev => (prev && prev.id === orderId) ? { ...prev, ...updatedForm } as Order : prev);
@@ -2771,49 +2896,23 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
   };
 
   const filteredOrders = orders.filter(order => {
-    const matchesSearch = order.customerName.toLowerCase().includes(orderSearch.toLowerCase());
-    
-    const parseDateString = (str: string, lang?: string) => {
-      if (!str || !str.includes('/')) return null;
-      const parts = str.split('/');
-      if (parts.length !== 3) return null;
-      
-      let month = parseInt(parts[0]);
-      let day = parseInt(parts[1]);
-      let year = parseInt(parts[2]);
-
-      // Always treat as MM/DD/YYYY by default (USA pattern), but if the first part (month) is > 12, it is definitely DD/MM/YYYY
-      if (month > 12) {
-        day = parseInt(parts[0]);
-        month = parseInt(parts[1]);
-      }
-      
-      if (!day || !month || !year || month > 12) return null;
-      const d = new Date(year, month - 1, day);
-      d.setHours(0, 0, 0, 0);
-      return d;
-    };
+    const q = orderSearch.trim().toLowerCase();
+    const matchesSearch = !q ||
+      (order.customerName || '').toLowerCase().includes(q) ||
+      (order.b2bCompanyName || '').toLowerCase().includes(q) ||
+      (order.phone || '').includes(orderSearch.trim());
 
     let matchesDate = true;
     if (startDate || endDate) {
-      // Try to use pickupDate first if available, otherwise use createdAt
-      let orderDate: Date | null = null;
-      if (order.pickupDate) {
-        orderDate = parseDateString(order.pickupDate, order.orderLanguage || settings.language || 'pt');
-      }
-      
-      if (!orderDate && order.createdAt?.toDate) {
-        orderDate = order.createdAt.toDate();
-        orderDate.setHours(0, 0, 0, 0);
-      }
+      const orderDate = getOrderEffectiveDate(order);
 
       if (orderDate) {
         if (startDate && startDate.length === 10) {
-          const start = parseDateString(startDate, settings.language || 'pt');
+          const start = parseOrderDateBR(startDate);
           if (start && orderDate < start) matchesDate = false;
         }
         if (endDate && endDate.length === 10) {
-          const end = parseDateString(endDate, settings.language || 'pt');
+          const end = parseOrderDateBR(endDate);
           if (end && orderDate > end) matchesDate = false;
         }
       } else {
@@ -2960,24 +3059,24 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
     const now = new Date();
     const firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
     const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-    setFinanceStartDate(firstDay.toISOString().split('T')[0]);
-    setFinanceEndDate(lastDay.toISOString().split('T')[0]);
+    setFinanceStartDate(toLocalISODate(firstDay));
+    setFinanceEndDate(toLocalISODate(lastDay));
   };
 
   const setPresetLastMonth = () => {
     const now = new Date();
     const firstDay = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     const lastDay = new Date(now.getFullYear(), now.getMonth(), 0);
-    setFinanceStartDate(firstDay.toISOString().split('T')[0]);
-    setFinanceEndDate(lastDay.toISOString().split('T')[0]);
+    setFinanceStartDate(toLocalISODate(firstDay));
+    setFinanceEndDate(toLocalISODate(lastDay));
   };
 
   const setPresetLast30Days = () => {
     const end = new Date();
     const start = new Date();
     start.setDate(end.getDate() - 29);
-    setFinanceStartDate(start.toISOString().split('T')[0]);
-    setFinanceEndDate(end.toISOString().split('T')[0]);
+    setFinanceStartDate(toLocalISODate(start));
+    setFinanceEndDate(toLocalISODate(end));
   };
 
   const setPresetAllTime = () => {
@@ -2990,51 +3089,9 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
     const start = financeStartDate ? new Date(financeStartDate + 'T00:00:00') : null;
     const end = financeEndDate ? new Date(financeEndDate + 'T23:59:59') : null;
 
-    const parseDateStr = (str: string, lang: string = 'pt') => {
-      if (!str) return null;
-      if (str.includes('-')) {
-        const parts = str.split('-');
-        if (parts.length === 3) {
-          if (parts[0].length === 4) {
-            const d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
-            d.setHours(0,0,0,0);
-            return d;
-          }
-        }
-      }
-      if (str.includes('/')) {
-        const parts = str.split('/');
-        if (parts.length === 3) {
-          if (lang === 'en') {
-            const d = new Date(parseInt(parts[2], 10), parseInt(parts[0], 10) - 1, parseInt(parts[1], 10));
-            d.setHours(0,0,0,0);
-            return d;
-          } else {
-            const d = new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
-            d.setHours(0,0,0,0);
-            return d;
-          }
-        }
-      }
-      const parsed = Date.parse(str);
-      if (!isNaN(parsed)) {
-        const d = new Date(parsed);
-        d.setHours(0,0,0,0);
-        return d;
-      }
-      return null;
-    };
-
     // 1. Filter Orders
     const filteredOrders = orders.filter(order => {
-      let orderDate: Date | null = null;
-      if (order.pickupDate) {
-        orderDate = parseDateStr(order.pickupDate, order.orderLanguage || settings.language || 'pt');
-      }
-      if (!orderDate && order.createdAt?.toDate) {
-        orderDate = order.createdAt.toDate();
-        orderDate.setHours(0, 0, 0, 0);
-      }
+      const orderDate = getOrderEffectiveDate(order);
       if (!orderDate) return false;
       if (start && orderDate < start) return false;
       if (end && orderDate > end) return false;
@@ -3866,22 +3923,28 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                 <div className="flex flex-col gap-2 bg-gray-50/90 p-4 rounded-2xl border border-gray-200 shadow-inner shrink-0">
                   <div className="text-[10px] font-black uppercase tracking-wider text-gray-600">Filtrar por Período</div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <div className="flex items-center gap-1.5 bg-white border border-gray-300 rounded-xl px-3 py-1.5 shadow-xs">
-                      <span className="text-[10px] font-bold text-gray-400 uppercase">De:</span>
-                      <input 
-                        type="date" 
-                        className="border-0 bg-transparent text-xs font-bold text-gray-800 outline-none cursor-pointer"
+                    <div className="flex items-center gap-1.5 bg-white border border-gray-300 rounded-xl px-2.5 py-1 shadow-xs w-[168px]">
+                      <span className="text-[10px] font-bold text-gray-400 uppercase shrink-0">De:</span>
+                      <BRDatePicker
+                        outputFormat="iso"
+                        compact
+                        popoverAlign="left"
+                        placeholder="DD/MM/AAAA"
+                        className="border-0 p-0 focus-within:ring-0 focus-within:border-transparent"
                         value={financeStartDate}
-                        onChange={e => setFinanceStartDate(e.target.value)}
+                        onChange={val => setFinanceStartDate(val)}
                       />
                     </div>
-                    <div className="flex items-center gap-1.5 bg-white border border-gray-300 rounded-xl px-3 py-1.5 shadow-xs">
-                      <span className="text-[10px] font-bold text-gray-400 uppercase">Até:</span>
-                      <input 
-                        type="date" 
-                        className="border-0 bg-transparent text-xs font-bold text-gray-800 outline-none cursor-pointer"
+                    <div className="flex items-center gap-1.5 bg-white border border-gray-300 rounded-xl px-2.5 py-1 shadow-xs w-[172px]">
+                      <span className="text-[10px] font-bold text-gray-400 uppercase shrink-0">Até:</span>
+                      <BRDatePicker
+                        outputFormat="iso"
+                        compact
+                        popoverAlign="right"
+                        placeholder="DD/MM/AAAA"
+                        className="border-0 p-0 focus-within:ring-0 focus-within:border-transparent"
                         value={financeEndDate}
-                        onChange={e => setFinanceEndDate(e.target.value)}
+                        onChange={val => setFinanceEndDate(val)}
                       />
                     </div>
                   </div>
@@ -4279,19 +4342,30 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
               <>
                 {/* Metrics Dashboard Grid */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 animate-fade-in">
-              {/* Revenue Card */}
-              <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-5 shadow-sm relative overflow-hidden flex flex-col justify-between h-32">
-                <div className="absolute right-3 top-3 bg-emerald-500/10 text-emerald-700 p-2 rounded-xl">
+              {/* Revenue Card (Clickable to view period orders list) */}
+              <button
+                type="button"
+                onClick={() => {
+                  setFinanceOrdersSearch('');
+                  setShowFinanceOrdersModal(true);
+                }}
+                title="Clique para ver a lista de pedidos deste período"
+                className="relative z-10 bg-emerald-50 border border-emerald-200 rounded-2xl p-5 shadow-sm overflow-hidden flex flex-col justify-between h-32 text-left cursor-pointer hover:shadow-md hover:border-emerald-400 hover:bg-emerald-100/60 active:scale-[0.99] transition-all group w-full"
+              >
+                <div className="absolute right-3 top-3 bg-emerald-500/10 text-emerald-700 p-2 rounded-xl group-hover:bg-emerald-500/20 transition-colors pointer-events-none">
                   <DollarSign size={22} />
                 </div>
                 <div className="text-xs font-bold uppercase text-emerald-800/80 tracking-wider">Receita (Faturamento)</div>
                 <div className="text-2xl font-black text-emerald-950 mt-1">
                   {currencySymbol} {totalRevenue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </div>
-                <div className="text-[10px] font-bold text-emerald-700/80 mt-1 uppercase">
-                  {filteredFinanceOrders.length} {filteredFinanceOrders.length === 1 ? 'Pedido no período' : 'Pedidos no período'}
+                <div className="text-[10px] font-bold text-emerald-700/90 mt-1 uppercase flex items-center justify-between gap-2 w-full">
+                  <span>{filteredFinanceOrders.length} {filteredFinanceOrders.length === 1 ? 'Pedido no período' : 'Pedidos no período'}</span>
+                  <span className="inline-flex items-center gap-0.5 text-emerald-800 group-hover:underline shrink-0">
+                    Ver pedidos <ChevronRight size={12} />
+                  </span>
                 </div>
-              </div>
+              </button>
 
               {/* Fixed Costs Card */}
               <div className="bg-amber-50 border border-amber-200 rounded-2xl p-5 shadow-sm relative overflow-hidden flex flex-col justify-between h-32">
@@ -4586,12 +4660,12 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                       </div>
 
                       <div className="space-y-1">
-                        <label className="text-[10px] font-bold uppercase text-gray-500">Data do Gasto</label>
-                        <input 
-                          type="date" 
-                          className="w-full p-2.5 rounded-xl border border-gray-300 bg-white text-xs font-bold text-gray-800 outline-none focus:ring-2 focus:ring-emerald-500"
+                        <label className="text-[10px] font-bold uppercase text-gray-500">Data do Gasto (DD/MM/AAAA)</label>
+                        <BRDatePicker
+                          outputFormat="iso"
+                          placeholder="DD/MM/AAAA"
                           value={newVarCost.date || ''}
-                          onChange={e => setNewVarCost({...newVarCost, date: e.target.value})}
+                          onChange={val => setNewVarCost({...newVarCost, date: val})}
                         />
                       </div>
                     </div>
@@ -4609,7 +4683,7 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                           type="button"
                           onClick={() => {
                             setIsEditingVarCost(null);
-                            setNewVarCost({ description: '', amount: 0, date: new Date().toISOString().split('T')[0] });
+                            setNewVarCost({ description: '', amount: 0, date: toLocalISODate(new Date()) });
                             setVarCostAmountInput('');
                           }}
                           className="px-4 py-3 rounded-xl font-bold bg-gray-200 text-gray-700 hover:bg-gray-300 transition-all cursor-pointer text-xs"
@@ -8133,7 +8207,7 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
 
                                 <div className="text-xs font-bold text-gray-700 flex items-center gap-1">
                                   <Clock size={12} className="text-emerald-700" />
-                                  <span>{info.timeStr ? `${info.timeStr}` : '06:00 PM'}</span>
+                                  <span>{info.timeStr ? `${info.timeStr}` : '18:00'}</span>
                                 </div>
 
                                 <div>
@@ -8259,37 +8333,21 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
             {orderViewMode === 'list' && (
               <div className="space-y-6">
                 <div className="flex flex-wrap items-center gap-3">
-                  <div className="relative">
-                    <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 text-black/60" size={18} />
-                    <input 
-                      type="text" 
+                  <div className="w-40">
+                    <BRDatePicker
+                      compact
                       placeholder="DD/MM/AAAA"
-                      className="pl-10 p-2 rounded-xl border-2 border-white bg-white/70 text-black font-semibold text-sm w-32 placeholder-black/50 focus:outline-none focus:ring-2 focus:ring-white"
                       value={startDate}
-                      onChange={e => {
-                        let val = e.target.value.replace(/\D/g, '');
-                        if (val.length > 8) val = val.slice(0, 8);
-                        if (val.length > 4) val = val.slice(0, 2) + '/' + val.slice(2, 4) + '/' + val.slice(4);
-                        else if (val.length > 2) val = val.slice(0, 2) + '/' + val.slice(2);
-                        setStartDate(val);
-                      }}
+                      onChange={setStartDate}
                     />
                   </div>
                   <span className="text-white font-semibold drop-shadow-sm">até</span>
-                  <div className="relative">
-                    <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 text-black/60" size={18} />
-                    <input 
-                      type="text" 
+                  <div className="w-40">
+                    <BRDatePicker
+                      compact
                       placeholder="DD/MM/AAAA"
-                      className="pl-10 p-2 rounded-xl border-2 border-white bg-white/70 text-black font-semibold text-sm w-32 placeholder-black/50 focus:outline-none focus:ring-2 focus:ring-white"
                       value={endDate}
-                      onChange={e => {
-                        let val = e.target.value.replace(/\D/g, '');
-                        if (val.length > 8) val = val.slice(0, 8);
-                        if (val.length > 4) val = val.slice(0, 2) + '/' + val.slice(2, 4) + '/' + val.slice(4);
-                        else if (val.length > 2) val = val.slice(0, 2) + '/' + val.slice(2);
-                        setEndDate(val);
-                      }}
+                      onChange={setEndDate}
                     />
                   </div>
                   <button 
@@ -8428,7 +8486,7 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                         >
                           <MessageCircle size={14} className="text-green-600" /> {order.phone}
                         </a>
-                        <span className="flex items-center gap-1"><Calendar size={14} /> Criado em: {order.createdAt?.toDate ? order.createdAt.toDate().toLocaleString('en-US') : 'N/A'}</span>
+                        <span className="flex items-center gap-1"><Calendar size={14} /> Criado em: {formatOrderFullDate(order.createdAt)}</span>
                         {order.pickupDate && (
                           <span 
                             className="flex items-center gap-1.5 font-black px-3 py-1 rounded-xl shadow-sm text-xs"
@@ -8773,30 +8831,12 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                         </span>
                       ) : (
                         <div className="mt-1.5 space-y-2 pt-1 border-t border-blue-100">
-                          <div className="flex items-center gap-1.5">
-                            <input
-                              type="text"
-                              value={tempOrderDate}
-                              onChange={(e) => setTempOrderDate(handleDateMask(e.target.value))}
-                              placeholder="DD/MM/AAAA"
-                              className="w-full text-xs font-bold p-2 bg-blue-50/50 border border-blue-400 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900"
-                              autoFocus
-                            />
-                            <div className="relative flex-shrink-0 flex items-center justify-center w-[36px] h-[36px] rounded-lg border border-gray-300 bg-gray-50 hover:bg-gray-100 text-blue-600 transition-colors cursor-pointer overflow-hidden shadow-xs">
-                              <Calendar size={16} className="pointer-events-none" />
-                              <input
-                                type="date"
-                                value={ddmmyyyyToYyyymmdd(tempOrderDate)}
-                                onChange={(e) => {
-                                  if (e.target.value) {
-                                    setTempOrderDate(yyyymmddToDdmmyyyy(e.target.value));
-                                  }
-                                }}
-                                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                                title="Selecionar no calendário"
-                              />
-                            </div>
-                          </div>
+                          <BRDatePicker
+                            compact
+                            placeholder="DD/MM/AAAA"
+                            value={tempOrderDate}
+                            onChange={setTempOrderDate}
+                          />
                           <div className="flex items-center justify-end gap-1.5">
                             <button
                               type="button"
@@ -9705,7 +9745,7 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95 }}
-              className="bg-white p-6 md:p-8 rounded-3xl w-full max-w-2xl shadow-2xl space-y-6 max-h-[90vh] overflow-y-auto border border-gray-200 text-gray-900"
+              className="bg-white p-5 sm:p-6 md:p-8 rounded-3xl w-full max-w-2xl shadow-2xl space-y-6 max-h-[90vh] overflow-y-auto overflow-x-hidden border border-gray-200 text-gray-900"
             >
               <div className="flex justify-between items-center pb-3 border-b border-gray-100">
                 <h3 className="text-2xl font-serif font-bold text-gray-900">Editar Pedido</h3>
@@ -9780,41 +9820,17 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                       </span>
                       <span className="text-[10px] text-gray-400 font-normal">DD/MM/AAAA</span>
                     </label>
-                    <div className="flex items-center gap-2">
-                      <input 
-                        type="text" 
-                        className="w-full p-3 rounded-xl border border-gray-300 bg-white text-gray-900 placeholder:text-gray-400 font-medium shadow-sm focus:outline-none focus:ring-2 focus:ring-amber-800/40"
-                        value={editOrderForm.scheduledDate || editOrderForm.pickupDate || ''}
-                        onChange={e => {
-                          const masked = handleDateMask(e.target.value);
-                          setEditOrderForm({
-                            ...editOrderForm, 
-                            pickupDate: masked,
-                            scheduledDate: masked
-                          });
-                        }}
-                        placeholder="DD/MM/AAAA"
-                      />
-                      <div className="relative flex-shrink-0 flex items-center justify-center w-[48px] h-[48px] rounded-xl border border-gray-300 bg-gray-50 hover:bg-gray-100 text-blue-600 transition-colors cursor-pointer overflow-hidden shadow-xs">
-                        <Calendar size={18} className="pointer-events-none" />
-                        <input 
-                          type="date"
-                          value={ddmmyyyyToYyyymmdd(editOrderForm.scheduledDate || editOrderForm.pickupDate || '')}
-                          onChange={e => {
-                            if (e.target.value) {
-                              const converted = yyyymmddToDdmmyyyy(e.target.value);
-                              setEditOrderForm({
-                                ...editOrderForm,
-                                pickupDate: converted,
-                                scheduledDate: converted
-                              });
-                            }
-                          }}
-                          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                          title="Escolher no calendário"
-                        />
-                      </div>
-                    </div>
+                    <BRDatePicker
+                      placeholder="DD/MM/AAAA"
+                      value={editOrderForm.scheduledDate || editOrderForm.pickupDate || ''}
+                      onChange={(val) => {
+                        setEditOrderForm({
+                          ...editOrderForm,
+                          pickupDate: val,
+                          scheduledDate: val
+                        });
+                      }}
+                    />
                   </div>
                   <div className="space-y-2">
                     <label className="text-xs font-bold uppercase tracking-wider text-gray-700">Preço Final (Total)</label>
@@ -9962,13 +9978,13 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                   )}
 
                   {/* Add item interface */}
-                  <div className="bg-gray-50 p-4 rounded-2xl border border-gray-200 space-y-3 shadow-sm">
+                  <div className="bg-gray-50 p-4 rounded-2xl border border-gray-200 space-y-3 shadow-sm min-w-0 overflow-hidden">
                     <p className="text-xs font-bold uppercase tracking-wider text-gray-700">Adicionar Novo Item ao Pedido</p>
-                    <div className="flex flex-col sm:flex-row gap-3">
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-3 min-w-0">
                       <select
                         value={selectedProductId}
                         onChange={e => setSelectedProductId(e.target.value)}
-                        className="flex-grow p-3 rounded-xl border border-gray-300 bg-white text-sm text-gray-900 font-medium shadow-sm focus:outline-none"
+                        className="w-full min-w-0 flex-1 truncate p-3 rounded-xl border border-gray-300 bg-white text-sm text-gray-900 font-medium shadow-sm focus:outline-none"
                       >
                         <option value="">-- Selecione um produto --</option>
                         {products.flatMap(p => {
@@ -9989,7 +10005,7 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                         })}
                       </select>
                       
-                      <div className="flex gap-2">
+                      <div className="flex items-center gap-2 shrink-0">
                         <input
                           type="number"
                           min="1"
@@ -10228,7 +10244,7 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
               </div>
 
               {/* Form de Dados do Cliente e Pedido */}
-              <form onSubmit={e => { e.preventDefault(); handleCreateManualOrder(); }} className="space-y-6">
+              <form noValidate onSubmit={e => { e.preventDefault(); handleCreateManualOrder(); }} className="space-y-6">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <label className="text-xs font-bold uppercase tracking-wider text-gray-700">Nome do Cliente</label>
@@ -10527,7 +10543,7 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
                               styleNumber: 1
                             });
                           }}
-                          className="w-full p-3 rounded-xl border border-gray-300 bg-white text-gray-900 font-medium text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-amber-800/40 focus:border-amber-800"
+                          className="w-full min-w-0 truncate p-3 rounded-xl border border-gray-300 bg-white text-gray-900 font-medium text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-amber-800/40 focus:border-amber-800"
                         >
                           <option value="">-- Selecione um produto --</option>
                           {products.map(p => (
@@ -11051,6 +11067,317 @@ TOTAL: ${currencySymbol} ${orderTotalStr}
           onClose={() => setActivePrintReceipt(null)} 
         />
       </AnimatePresence>
+
+      {showFinanceOrdersModal && !selectedOrderModal && !isEditingOrder && !activePrintReceipt && typeof document !== 'undefined' && createPortal((() => {
+        const formatISOToBR = (iso?: string) => {
+          if (!iso || !iso.includes('-')) return '';
+          const parts = iso.split('-');
+          if (parts.length !== 3) return iso;
+          return `${parts[2]}/${parts[1]}/${parts[0]}`;
+        };
+
+        const periodLabel = financeOrdersScope === 'all'
+          ? 'Todos os pedidos do sistema'
+          : (financeStartDate || financeEndDate)
+            ? `${financeStartDate ? formatISOToBR(financeStartDate) : 'Início'} até ${financeEndDate ? formatISOToBR(financeEndDate) : 'Hoje'}`
+            : 'Todos os períodos';
+
+        const normalizeText = (s: string) =>
+          s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+        const q = normalizeText(financeOrdersSearch.trim());
+        const qDigits = financeOrdersSearch.replace(/\D/g, '');
+
+        const matchesOrderQuery = (o: Order) => {
+          if (!q) return true;
+          const name = normalizeText(String((o.isB2B || o.isPJ ? (o.b2bCompanyName || o.customerName) : o.customerName) || ''));
+          const email = normalizeText(String(o.email || ''));
+          const phone = String(o.phone || '');
+          const phoneDigits = phone.replace(/\D/g, '');
+          const id = normalizeText(String(o.id || ''));
+          const itemsText = Array.isArray(o.items)
+            ? normalizeText(o.items.map(it => it.title || '').join(' '))
+            : '';
+          return (
+            name.includes(q) ||
+            email.includes(q) ||
+            phone.includes(financeOrdersSearch.trim()) ||
+            (qDigits.length > 0 && phoneDigits.includes(qDigits)) ||
+            id.includes(q) ||
+            itemsText.includes(q)
+          );
+        };
+
+        const sortOrdersNewestFirst = (a: Order, b: Order) => {
+          const dA = getOrderEffectiveDate(a)?.getTime() || 0;
+          const dB = getOrderEffectiveDate(b)?.getTime() || 0;
+          if (dB !== dA) return dB - dA;
+          const cA = getCreatedAtDate(a.createdAt)?.getTime() || 0;
+          const cB = getCreatedAtDate(b.createdAt)?.getTime() || 0;
+          return cB - cA;
+        };
+
+        const baseOrders = financeOrdersScope === 'all' ? orders : filteredFinanceOrders;
+        const modalOrders = [...baseOrders]
+          .filter(matchesOrderQuery)
+          .sort(sortOrdersNewestFirst);
+
+        const periodIds = new Set(filteredFinanceOrders.map(o => o.id));
+        const otherPeriodMatches = (financeOrdersScope === 'period' && q.length > 0)
+          ? orders.filter(o => !periodIds.has(o.id) && matchesOrderQuery(o)).sort(sortOrdersNewestFirst)
+          : [];
+
+        const displayedTotal = baseOrders.reduce((sum, o) => sum + (Number(o.total) || 0), 0);
+
+        const renderOrderCard = (order: Order, isOutsidePeriod?: boolean) => {
+          const info = getOrderScheduledInfo(order);
+          const displayName = String((order.isB2B || order.isPJ)
+            ? (order.b2bCompanyName || order.customerName || 'Cliente')
+            : (order.customerName || 'Cliente'));
+          const isDelivered = order.deliveryStatus === 'delivered';
+          const orderIdStr = String(order.id || '');
+          const phoneStr = String(order.phone || '');
+          const itemsList = Array.isArray(order.items) ? order.items : [];
+          const orderTotal = Number(order.total) || 0;
+          const isManualFlag = Boolean((order as any).isManual) || itemsList.some((it: any) => Boolean(it?.isCustomItem));
+
+          return (
+            <div
+              key={orderIdStr}
+              className={cn(
+                "bg-white border rounded-2xl p-4 shadow-xs hover:shadow-md transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-4",
+                isOutsidePeriod
+                  ? "border-amber-300 bg-amber-50/30 hover:border-amber-400"
+                  : "border-gray-200 hover:border-emerald-300"
+              )}
+            >
+              <div className="space-y-1.5 min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-md bg-gray-100 text-gray-700 border border-gray-200">
+                    #{orderIdStr.slice(-6).toUpperCase()}
+                  </span>
+                  {isManualFlag && (
+                    <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200">
+                      Manual
+                    </span>
+                  )}
+                  <span className={cn(
+                    "text-[10px] font-extrabold px-2 py-0.5 rounded-md border flex items-center gap-1",
+                    isOutsidePeriod
+                      ? "bg-amber-100 text-amber-900 border-amber-300"
+                      : "bg-emerald-50 text-emerald-800 border-emerald-200"
+                  )}>
+                    <Calendar size={10} />
+                    {info.dateDisplay || 'Sem data'} ({info.isDelivery ? 'Delivery' : 'Retirada'})
+                  </span>
+                  <span className={cn(
+                    "text-[10px] font-bold px-2 py-0.5 rounded-md border",
+                    isDelivered
+                      ? "bg-emerald-600 text-white border-emerald-600"
+                      : "bg-amber-50 text-amber-800 border-amber-200"
+                  )}>
+                    {isDelivered ? '✓ Entregue' : '⏳ A Entregar'}
+                  </span>
+                  <span className={cn(
+                    "text-[10px] font-bold px-2 py-0.5 rounded-md border",
+                    order.paymentStatus === 'full'
+                      ? "bg-green-50 text-green-700 border-green-200"
+                      : order.paymentStatus === 'half'
+                        ? "bg-amber-50 text-amber-800 border-amber-200"
+                        : "bg-red-50 text-red-700 border-red-200"
+                  )}>
+                    {order.paymentStatus === 'full' ? 'Pago' : order.paymentStatus === 'half' ? '50% Pago' : 'Pendente'}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-baseline gap-2">
+                  <h4 className="font-bold text-sm sm:text-base text-gray-900 truncate">
+                    {displayName}
+                  </h4>
+                  {phoneStr && (
+                    <span className="text-xs text-gray-500 font-medium">
+                      {formatBRPhone(phoneStr)}
+                    </span>
+                  )}
+                </div>
+
+                <p className="text-xs text-gray-600 line-clamp-2">
+                  {itemsList.length > 0
+                    ? itemsList.map(it => `${it.quantity || 1}x ${it.title || 'Item'}`).join(', ')
+                    : 'Sem itens'}
+                </p>
+              </div>
+
+              <div className="flex sm:flex-col items-center sm:items-end justify-between gap-2 pt-2 sm:pt-0 border-t sm:border-t-0 border-gray-100 shrink-0">
+                <div className="text-base sm:text-lg font-black text-emerald-800">
+                  {currencySymbol} {orderTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedOrderModal(order)}
+                    className="px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-xs font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                    title="Ver detalhes completos"
+                  >
+                    <Eye size={13} />
+                    <span>Detalhes</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => printOrder(order)}
+                    className="p-1.5 rounded-lg bg-white hover:bg-gray-100 text-gray-700 border border-gray-200 cursor-pointer transition-colors"
+                    title="Imprimir Comanda"
+                  >
+                    <Printer size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsEditingOrder(order);
+                      setEditOrderForm(getInitialEditOrderForm(order));
+                    }}
+                    className="p-1.5 rounded-lg bg-white hover:bg-blue-50 text-blue-600 border border-blue-200 cursor-pointer transition-colors"
+                    title="Editar Pedido"
+                  >
+                    <Edit2 size={14} />
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        };
+
+        return (
+          <div
+            onClick={() => setShowFinanceOrdersModal(false)}
+            className="fixed inset-0 z-[9990] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bg-white rounded-3xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-hidden flex flex-col border border-gray-200 text-gray-900"
+            >
+              {/* Header */}
+              <div className="p-5 sm:p-6 border-b border-gray-100 flex items-start justify-between gap-4 bg-gradient-to-r from-emerald-50/80 to-white">
+                <div className="space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="inline-flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider px-2.5 py-1 rounded-lg bg-emerald-100 text-emerald-800">
+                      <CalendarDays size={12} />
+                      <span>{periodLabel}</span>
+                    </div>
+                    <div className="inline-flex bg-gray-100 p-0.5 rounded-lg border border-gray-200">
+                      <button
+                        type="button"
+                        onClick={() => setFinanceOrdersScope('period')}
+                        className={cn(
+                          "px-2.5 py-1 rounded-md text-[10px] font-bold uppercase cursor-pointer transition-all",
+                          financeOrdersScope === 'period'
+                            ? "bg-white text-emerald-800 shadow-xs"
+                            : "text-gray-600 hover:text-gray-900"
+                        )}
+                      >
+                        No Período ({filteredFinanceOrders.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFinanceOrdersScope('all')}
+                        className={cn(
+                          "px-2.5 py-1 rounded-md text-[10px] font-bold uppercase cursor-pointer transition-all",
+                          financeOrdersScope === 'all'
+                            ? "bg-white text-emerald-800 shadow-xs"
+                            : "text-gray-600 hover:text-gray-900"
+                        )}
+                      >
+                        Todos ({orders.length})
+                      </button>
+                    </div>
+                  </div>
+                  <h3 className="font-serif font-black text-xl sm:text-2xl text-gray-900">
+                    {financeOrdersScope === 'all'
+                      ? `Todos os Pedidos do Sistema (${orders.length})`
+                      : `Pedidos Contabilizados no Período (${filteredFinanceOrders.length})`}
+                  </h3>
+                  <p className="text-xs sm:text-sm text-gray-600 font-semibold">
+                    Receita total: <span className="text-emerald-700 font-black">{currencySymbol} {displayedTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowFinanceOrdersModal(false)}
+                  className="p-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition-all cursor-pointer shrink-0"
+                  title="Fechar"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              {/* Search */}
+              <div className="px-5 sm:px-6 pt-4 pb-2 bg-gray-50/50 border-b border-gray-100">
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
+                  <input
+                    type="text"
+                    placeholder="Buscar cliente, telefone, e-mail, item ou código do pedido..."
+                    value={financeOrdersSearch}
+                    onChange={e => setFinanceOrdersSearch(e.target.value)}
+                    className="w-full pl-9 pr-8 py-2.5 text-xs sm:text-sm rounded-xl border border-gray-300 bg-white text-gray-900 font-medium placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/40 focus:border-emerald-600"
+                  />
+                  {financeOrdersSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setFinanceOrdersSearch('')}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 cursor-pointer"
+                    >
+                      <X size={14} />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Orders List */}
+              <div className="p-5 sm:p-6 overflow-y-auto space-y-3 flex-grow bg-gray-50/40">
+                {modalOrders.length === 0 ? (
+                  <div className="text-center py-8 text-sm text-gray-500 font-medium bg-white rounded-2xl border border-dashed border-gray-200">
+                    {baseOrders.length === 0
+                      ? 'Nenhum pedido registrado neste período.'
+                      : 'Nenhum pedido encontrado neste período para esta busca.'}
+                  </div>
+                ) : (
+                  modalOrders.map(order => renderOrderCard(order, false))
+                )}
+
+                {otherPeriodMatches.length > 0 && (
+                  <div className="pt-3 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2 px-1">
+                      <span className="text-xs font-extrabold uppercase tracking-wider text-amber-800">
+                        Encontrado(s) fora do período filtrado ({otherPeriodMatches.length})
+                      </span>
+                      <span className="text-[11px] text-amber-700 font-medium">
+                        Clique em Editar para ajustar a data se necessário
+                      </span>
+                    </div>
+                    {otherPeriodMatches.map(order => renderOrderCard(order, true))}
+                  </div>
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="p-4 border-t border-gray-100 bg-white flex items-center justify-between gap-3">
+                <span className="text-xs text-gray-500 font-semibold">
+                  Exibindo {modalOrders.length} de {baseOrders.length} pedido(s)
+                  {otherPeriodMatches.length > 0 ? ` (+ ${otherPeriodMatches.length} em outro período)` : ''}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowFinanceOrdersModal(false)}
+                  className="px-5 py-2 bg-gray-200 hover:bg-gray-300 text-gray-800 rounded-xl font-bold text-xs cursor-pointer transition-colors"
+                >
+                  Fechar
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })(), document.body)}
     </div>
   );
 }

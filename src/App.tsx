@@ -88,6 +88,8 @@ export default function App() {
         if (!data.whatsappCountryCode || data.whatsappCountryCode !== '+55') {
           data.whatsappCountryCode = '+55';
         }
+        data.language = 'pt';
+        data.currency = 'BRL';
         setSettings(prev => ({ ...prev, ...data }));
         setLoading(false);
 
@@ -169,7 +171,7 @@ export default function App() {
       <div className="relative z-0 flex flex-col min-h-screen">
         <ErrorBoundary fallbackTitle="Falha temporária ao carregar a página" fallbackMessage="Ocorreu um imprevisto de renderização no navegador. Clique abaixo para recarregar sem perder seus dados.">
           {isAdmin ? (
-            <Admin settings={settings} setSettings={setSettings} setIsAdmin={setIsAdmin} />
+            <Admin settings={{ ...settings, language: 'pt', currency: 'BRL' }} setSettings={setSettings} setIsAdmin={setIsAdmin} />
           ) : (
             <>
               <Menu settings={{ ...settings, language: 'pt', currency: 'BRL' }} />
